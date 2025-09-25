@@ -1,0 +1,6 @@
+*.md
+*.idea/
+*.log
+*.txt
+*data/
+*__pycache__/
