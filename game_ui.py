@@ -99,7 +99,7 @@ class GomokuUI:
         self.human_player = GomokuBoard.BLACK
         self.game_mode = "human_vs_ai"  # 游戏模式
         self.difficulty = "medium"      # AI难度
-        self.ai_type = "alphazero"      # AI类型（只支持AlphaZero）
+        self.ai_type = "alphazero"      # AI类型（alphazero 或 bg_planner）
         
         # UI状态
         self.selected_difficulty = "medium"
@@ -143,7 +143,7 @@ class GomokuUI:
         
         # 创建AlphaZero AI
         if game_mode in ["human_vs_ai", "ai_vs_ai"]:
-            self.ai_player = AIFactory.create_ai("alphazero", GomokuBoard.WHITE, difficulty)
+            self.ai_player = AIFactory.create_ai(self.ai_type, GomokuBoard.WHITE, difficulty, device="cpu")
         
         self.show_menu = False
         self.show_settings = False
@@ -178,6 +178,19 @@ class GomokuUI:
             
             # 检查游戏结束
             if self.board.game_over and self.on_game_over:
+                # 将对局数据保存为可用于训练的格式
+                try:
+                    game = {
+                        'moves': [(self.board.get_board_state().tolist(), self.last_move_pos, self.board.current_player)],
+                        'winner': self.board.winner,
+                        'game_length': self.board.get_move_count()
+                    }
+                    import os, json, time as _t
+                    os.makedirs('data/human_games', exist_ok=True)
+                    with open(os.path.join('data/human_games', f'game_{int(_t.time())}.json'), 'w', encoding='utf-8') as f:
+                        json.dump(game, f, ensure_ascii=False)
+                except Exception:
+                    pass
                 self.on_game_over(self.board.winner)
     
     def handle_click(self, pos: Tuple[int, int]) -> bool:
@@ -242,6 +255,15 @@ class GomokuUI:
                 button_y = 230 + i * 40
                 if 100 <= x <= 300 and button_y <= y <= button_y + 30:
                     self.selected_difficulty = difficulty
+                    return True
+
+            # AI 类型切换点击
+            types = ["alphazero", "bg_planner"]
+            for i, t in enumerate(types):
+                ty = 190 + i * 30
+                if 180 <= x <= 340 and ty <= y <= ty + 24:
+                    self.selected_ai_type = t
+                    self.ai_type = t
                     return True
         
         return False
@@ -363,7 +385,7 @@ class GomokuUI:
         self.screen.blit(back_text, back_text_rect)
         
         # AI类型选择（只显示AlphaZero）
-        ai_title = self.font_medium.render("AI类型: AlphaZero", True, Colors.BLACK)
+        ai_title = self.font_medium.render(f"AI类型: {self.ai_type}", True, Colors.BLACK)
         self.screen.blit(ai_title, (100, 120))
         
         # 难度选择
@@ -382,6 +404,18 @@ class GomokuUI:
             text = self.font_small.render(difficulty, True, Colors.BLACK)
             text_rect = text.get_rect(center=button_rect.center)
             self.screen.blit(text, text_rect)
+
+        # AI 类型切换按钮
+        types = ["alphazero", "bg_planner"]
+        self.screen.blit(self.font_medium.render("AI类型:", True, Colors.BLACK), (100, 160))
+        for i, t in enumerate(types):
+            y = 190 + i * 30
+            rect = pygame.Rect(180, y, 160, 24)
+            color = Colors.GREEN if t == self.selected_ai_type else Colors.LIGHT_GRAY
+            pygame.draw.rect(self.screen, color, rect)
+            pygame.draw.rect(self.screen, Colors.BLACK, rect, 2)
+            txt = self.font_small.render(t, True, Colors.BLACK)
+            self.screen.blit(txt, txt.get_rect(center=rect.center))
     
     def _draw_game(self):
         """绘制游戏界面"""

@@ -1,580 +1,548 @@
 """
-Enhanced AlphaZero-Gomoku Training Framework
-增强的AlphaZero五子棋训练框架
+完善版训练脚本（CPU 友好，融合模型）
 
-这个模块实现了高性能、可扩展的AlphaZero训练系统，包括：
-- 并行自我对弈数据生成
-- 优先经验回放缓冲区
-- 混合精度训练
-- 增强的模型架构
-- 课程学习和对抗性训练
-- 自适应学习率调整
-- 正则化策略
+阶段一：自我对弈数据生成（AlphaZeroGomokuAI）
+阶段二：模型训练与优化（数据加载、数据增强、调度、早停、梯度裁剪）
+阶段三：模型评估与验证（胜率与损失）
+
+保存策略：
+- 每迭代保存 models/alphazero_gomoku_iter_{i}.pth
+- 维护 models/alphazero_gomoku_best.pth（基于验证指标）
+- 最终保存 models/alphazero_gomoku_final.pth
+
+注：本脚本专为 CPU 运行优化，合理控制对弈数量与 MCTS 模拟次数。
 """
 
 import os
-import time
+import math
 import random
+import copy
+import time
+from typing import List, Tuple, Dict, Any, Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset
-from typing import List, Tuple, Dict, Any, Optional
-import pickle
-import json
-from tqdm import tqdm
-import logging
-
+from torch.utils.data import Dataset, DataLoader
 
 from gomoku_board import GomokuBoard
-from neural_network import AlphaZeroGomokuNet, GomokuModel
 from ai_agent import AlphaZeroGomokuAI
+from neural_network import GomokuModel
 
 
+# ----------------------------
+# 数据增强：棋盘的 8 种对称变换
+# ----------------------------
+
+def _idx_to_rc(idx: int, n: int = 15) -> Tuple[int, int]:
+    return idx // n, idx % n
+
+def _rc_to_idx(r: int, c: int, n: int = 15) -> int:
+    return r * n + c
+
+def _transform_planes(planes: np.ndarray, k_rot: int, flip: bool) -> np.ndarray:
+    # planes: (3, H, W)
+    x = planes
+    for _ in range(k_rot % 4):
+        x = np.rot90(x, k=1, axes=(1, 2))
+    if flip:
+        x = np.flip(x, axis=2)  # 水平翻转
+    return x.copy()
+
+def _transform_index(idx: int, k_rot: int, flip: bool, n: int = 15) -> int:
+    r, c = _idx_to_rc(idx, n)
+    # 将 (r,c) 应用相同的变换
+    # 旋转 90 度： (r, c) -> (c, n-1-r)
+    for _ in range(k_rot % 4):
+        r, c = c, n - 1 - r
+    if flip:
+        c = n - 1 - c
+    return _rc_to_idx(r, c, n)
+
+def augment_sample(planes: np.ndarray, move_idx: int) -> List[Tuple[np.ndarray, int]]:
+    out = []
+    for k_rot in range(4):
+        for flip in (False, True):
+            x = _transform_planes(planes, k_rot, flip)
+            y = _transform_index(move_idx, k_rot, flip)
+            out.append((x, y))
+    return out
 
 
-class _SilenceLogs:
-    """上下文：暂时将指定logger降为WARNING，避免与tqdm进度条互相干扰"""
-    def __init__(self, logger_names: List[str]):
-        self.logger_names = logger_names
-        self.original_levels = {}
+# ----------------------------
+# 简单经验缓冲区
+# ----------------------------
 
-    def __enter__(self):
-        for name in self.logger_names:
-            lg = logging.getLogger(name)
-            self.original_levels[name] = lg.level
-            lg.setLevel(logging.WARNING)
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        for name, lvl in self.original_levels.items():
-            logging.getLogger(name).setLevel(lvl)
-
-
-class GameRecord:
-    """
-    游戏记录类
-    用于记录自我对弈过程中的每一步移动和最终结果
-    """
-    
+class SimpleReplay:
     def __init__(self):
-        self.moves = []  # [(board_state, move, player), ...]
-        self.winner = None  # 获胜者 (1=黑子, 2=白子, None=平局)
-        self.game_length = 0  # 游戏总步数
-    
-    def add_move(self, board_state: np.ndarray, move: Tuple[int, int], player: int):
-        """
-        添加移动记录
-        参数:
-            board_state: 当前棋盘状态
-            move: 移动位置 (行, 列)
-            player: 玩家编号
-        """
-        self.moves.append((board_state.copy(), move, player))
-        self.game_length += 1
-    
-    def set_winner(self, winner: int):
-        """
-        设置获胜者
-        参数:
-            winner: 获胜者编号 (1=黑子, 2=白子, None=平局)
-        """
-        self.winner = winner
-    
-    def get_training_data(self) -> List[Tuple[np.ndarray, int, float]]:
-        """
-        获取训练数据
-        返回: 训练数据列表，每个元素为(board_state, move_index, value)
-        """
-        training_data = []
-        
-        for i, (board_state, move, player) in enumerate(self.moves):
-            # 计算移动索引（将2D坐标转换为1D索引）
-            move_index = move[0] * 15 + move[1]
-            
-            # 计算价值（基于游戏结果和位置奖励）
-            base_value = 0.0
-            if self.winner == player:
-                base_value = 1.0  # 获胜
-            elif self.winner is None:
-                base_value = 0.0  # 平局
+        self.states: List[np.ndarray] = []      # (3, 15, 15)
+        self.move_indices: List[int] = []       # 0..224
+        self.players: List[int] = []            # 1 or 2
+        self.outcomes: List[int] = []           # -1/0/1
+
+    def add(self, planes: np.ndarray, move_idx: int, player: int):
+        self.states.append(planes.astype(np.float32))
+        self.move_indices.append(int(move_idx))
+        self.players.append(int(player))
+
+    def finalize_with_winner(self, winner: Optional[int]):
+        for p in self.players:
+            if winner is None:
+                self.outcomes.append(0)
             else:
-                base_value = -1.0  # 失败
-            
-            # 添加位置奖励机制
-            position_bonus = self._calculate_position_bonus(move, board_state, player)
-            value = base_value + position_bonus
-            
-            training_data.append((board_state, move_index, value))
-        
-        return training_data
-    
-    def _calculate_position_bonus(self, move: Tuple[int, int], board_state: np.ndarray, player: int) -> float:
-        """
-        计算位置奖励
-        鼓励AI选择中心区域和形成连子
-        """
-        row, col = move
-        bonus = 0.0
-        
-        # 中心区域奖励
-        center = 7  # 15x15棋盘的中心
-        distance_from_center = abs(row - center) + abs(col - center)
-        center_bonus = max(0, (10 - distance_from_center) * 0.01)
-        bonus += center_bonus
-        
-        # 连子奖励
-        directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
-        for dr, dc in directions:
-            count = 1  # 包含当前棋子
-            # 向一个方向计数
-            r, c = row + dr, col + dc
-            while (0 <= r < 15 and 0 <= c < 15 and board_state[r, c] == player):
-                count += 1
-                r += dr
-                c += dc
-            # 向相反方向计数
-            r, c = row - dr, col - dc
-            while (0 <= r < 15 and 0 <= c < 15 and board_state[r, c] == player):
-                count += 1
-                r -= dr
-                c -= dc
-            
-            # 根据连子数量给予奖励
-            if count >= 5:
-                bonus += 0.1  # 五子连珠
-            elif count == 4:
-                bonus += 0.05  # 四子连珠
-            elif count == 3:
-                bonus += 0.02  # 三子连珠
-        
-        return bonus
+                self.outcomes.append(1 if p == winner else -1)
+
+    def __len__(self) -> int:
+        return len(self.states)
 
 
-class SelfPlayTrainer:
+# ----------------------------
+# Dataset 与 DataLoader
+# ----------------------------
+
+class GomokuSelfPlayDataset(Dataset):
+    def __init__(self, replay: SimpleReplay, use_augmentation: bool = True, augment_ratio: float = 0.5):
+        self.samples: List[Tuple[np.ndarray, int, float]] = []  # (planes, move_idx, value)
+        n = len(replay)
+        indices = list(range(n))
+        # 将原始样本纳入
+        for i in indices:
+            planes = replay.states[i]
+            move_idx = replay.move_indices[i]
+            value = float(replay.outcomes[i])
+            self.samples.append((planes, move_idx, value))
+        # 数据增强：按比例对样本做 8 倍对称增强（子集）
+        if use_augmentation and n > 0:
+            aug_count = int(n * augment_ratio)
+            chosen = random.sample(indices, k=max(1, aug_count))
+            for i in chosen:
+                planes = replay.states[i]
+                move_idx = replay.move_indices[i]
+                value = float(replay.outcomes[i])
+                for aug_planes, aug_idx in augment_sample(planes, move_idx):
+                    self.samples.append((aug_planes, aug_idx, value))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        planes, move_idx, value = self.samples[idx]
+        x = torch.from_numpy(planes)            # (3,15,15)
+        y_policy = torch.tensor(move_idx, dtype=torch.long)
+        y_value = torch.tensor([value], dtype=torch.float32)
+        return x, y_policy, y_value
+
+
+# ----------------------------
+# 自我对弈 + 评价
+# ----------------------------
+
+def play_one_game(ai_black: AlphaZeroGomokuAI, ai_white: AlphaZeroGomokuAI, 
+                  step_timeout: float = 10.0, game_timeout: float = 300.0) -> Tuple[SimpleReplay, int]:
     """
-    AlphaZero-Gomoku自我对弈训练器
-    实现完整的训练流程：自我对弈 -> 数据生成 -> 模型训练 -> 模型评估
+    进行一局自我对弈（带超时保护）
+    参数:
+        ai_black: 黑子AI
+        ai_white: 白子AI
+        step_timeout: 单步超时时间（秒）
+        game_timeout: 整局超时时间（秒）
     """
-    
-    def __init__(self, model_path: Optional[str] = None, device: str = "auto", 
-                 learning_rate: float = 0.001, batch_size: int = 512):
-        """
-        初始化训练器
-        参数:
-            model_path: 预训练模型路径
-            device: 计算设备 ('auto', 'cpu', 'cuda')
-            learning_rate: 学习率
-            batch_size: 批大小
-        """
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if device == "auto" else torch.device(device)
-        
-        # 创建AlphaZero-Gomoku模型（减小残差块数量以提速）
-        self.model = AlphaZeroGomokuNet(15, 3, num_residual=2)
-        self.model.to(self.device)
-        
-        # 优化器和学习率调度器
-        self.learning_rate = learning_rate
-        self.batch_size = batch_size
-        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=50, gamma=0.8)
-        
-        # 可视化已禁用
-        self.visualizer = None
-        
-        # 训练数据
-        self.training_data = []
-        self.validation_data = []
-        
-        # 训练统计
-        self.training_stats = {
-            'games_played': 0,
-            'total_moves': 0,
-            'training_loss': [],
-            'validation_loss': [],
-            'win_rate': [],
-            'iterations': 0,
-            'best_model_path': None,
-            'best_win_rate': 0.0
-        }
-        
-        # 设置日志（在任何可能使用logger的方法前完成）
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
+    board = GomokuBoard()
+    buf = SimpleReplay()
+    start_moves = board.get_move_count()
+    game_start_time = time.time()
+    step_count = 0
+    slow_steps = 0  # 慢步计数
 
-        # 自动加载预训练模型（优先加载最优模型）
-        if model_path and os.path.exists(model_path):
-            self.load_model(model_path)
-        else:
-            # 优先尝试加载最优模型
-            best_model = "models/alphazero_gomoku_best.pth"
-            if os.path.exists(best_model):
-                self.load_model(best_model)
-                print(f"Loaded best model from {best_model}")
-            else:
-                # 如果没有最优模型，尝试加载最新模型
-                latest_model = self._find_latest_model()
-                if latest_model:
-                    self.load_model(latest_model)
-                    print(f"Loaded latest model from {latest_model}")
-                else:
-                    print("No pretrained model found, using random initialization")
+    while not board.game_over:
+        current_time = time.time()
+        game_elapsed = current_time - game_start_time
         
-        # 自动保存配置
-        self.auto_save_interval = 10  # 每10个游戏自动保存一次
-        self.best_model_threshold = 0.6  # 最佳模型阈值
-
-    def _find_latest_model(self) -> Optional[str]:
-        """
-        查找最新的训练模型
-        返回: 最新模型路径，如果没有则返回None
-        """
-        models_dir = "models"
-        if not os.path.exists(models_dir):
-            return None
+        # 整局超时保护
+        if game_elapsed > game_timeout:
+            print(f"\r    ├── 对局超时: {step_count}步 [总用时:{game_elapsed:.1f}s] ⚠️", end="")
+            break
+            
+        current_player = board.current_player
+        ai = ai_black if current_player == GomokuBoard.BLACK else ai_white
         
-        model_files = []
-        for file in os.listdir(models_dir):
-            if file.startswith("alphazero_gomoku_iter_") and file.endswith(".pth"):
-                model_files.append(os.path.join(models_dir, file))
-        
-        if not model_files:
-            return None
-        
-        model_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-        return model_files[0]
-
-    def _auto_save_model(self, iteration: int, win_rate: float = None):
-        """自动保存模型"""
-        current_model_path = f"models/alphazero_gomoku_iter_{iteration}.pth"
-        self.save_model(current_model_path)
-        if win_rate and win_rate > self.best_model_threshold:
-            if win_rate > self.training_stats['best_win_rate']:
-                self.training_stats['best_win_rate'] = win_rate
-                best_model_path = f"models/alphazero_gomoku_best.pth"
-                self.save_model(best_model_path)
-                self.training_stats['best_model_path'] = best_model_path
-                self.logger.info(f"New best model saved with win rate: {win_rate:.3f}")
-
-    def self_play_game(self, temperature: float = 1.0, max_moves: int = 200) -> GameRecord:
-        """进行一局自我对弈（限制步数，防止卡住）"""
-        board = GomokuBoard()
-        record = GameRecord()
-        ai = AlphaZeroGomokuAI(1, "easy")
-        moves_done = 0
-        while not board.game_over and moves_done < max_moves:
-            current_player = board.current_player
+        # 单步超时保护
+        step_start = time.time()
+        try:
             move = ai.get_move(board)
+            step_elapsed = time.time() - step_start
+            
+            # 检查是否超时
+            if step_elapsed > step_timeout:
+                print(f"\r    ├── 步{step_count+1}超时: {step_elapsed:.1f}s > {step_timeout}s ⚠️", end="")
+                # 使用随机移动继续
+                valid_moves = board.get_valid_moves()
+                if valid_moves:
+                    move = random.choice(valid_moves)
+        else:
+                    break
+            elif step_elapsed > 3.0:
+                slow_steps += 1
+                print(f"\r    ├── 对局{step_count+1}: 步数:{step_count+1} [总用时:{game_elapsed:.1f}s] 慢步警告⚠️", end="")
+            else:
+                print(f"\r    ├── 对局{step_count+1}: 步数:{step_count+1} [总用时:{game_elapsed:.1f}s]", end="")
+                
+        except Exception as e:
+            print(f"\r    ├── 步{step_count+1}异常: {str(e)[:30]}... ⚠️", end="")
+            # 使用随机移动继续
+            valid_moves = board.get_valid_moves()
+            if valid_moves:
+                move = random.choice(valid_moves)
+                else:
+                break
+        
+        if move is None:
+            break
+            
+        # 记录当前状态
+        planes = board.get_board_tensor()
+        move_idx = move[0] * board.BOARD_SIZE + move[1]
+        buf.add(planes, move_idx, current_player)
+        board.make_move(move[0], move[1])
+        step_count += 1
+
+    buf.finalize_with_winner(board.winner)
+    game_len = board.get_move_count() - start_moves
+    
+    # 显示最终结果
+    final_time = time.time() - game_start_time
+    winner_text = "玩家1胜" if board.winner == GomokuBoard.BLACK else "玩家2胜" if board.winner == GomokuBoard.WHITE else "平局"
+    print(f"\r    ├── 对局完成: {game_len}步 {winner_text} [用时:{final_time:.1f}s]")
+    
+    return buf, game_len
+
+
+def evaluate_model(current: GomokuModel, baseline: Optional[GomokuModel], device: torch.device,
+                   games: int = 8, eval_difficulty: str = "easy", eval_num_sim: int = 60,
+                   eval_plans: int = 2) -> Dict[str, Any]:
+    # 如果没有基线，使用随机着法作为对手
+    class RandomAgent:
+        def get_move(self, board: GomokuBoard):
+            v = board.get_valid_moves()
+            return random.choice(v) if v else None
+
+    black_is_current = True
+    wins = 0
+    losses = 0
+    draws = 0
+
+    for g in range(games):
+        board = GomokuBoard()
+        color_a = GomokuBoard.BLACK if black_is_current else GomokuBoard.WHITE
+        if baseline is None:
+            ai_a = AlphaZeroGomokuAI(color_a, difficulty=eval_difficulty, device=str(device), planner_steps=eval_plans)
+            ai_a.params["num_simulations"] = eval_num_sim
+            ai_b = RandomAgent()
+        else:
+            ai_a = AlphaZeroGomokuAI(color_a, difficulty=eval_difficulty, device=str(device), planner_steps=eval_plans)
+            other_color = GomokuBoard.WHITE if color_a == GomokuBoard.BLACK else GomokuBoard.BLACK
+            ai_b = AlphaZeroGomokuAI(other_color, difficulty=eval_difficulty, device=str(device), planner_steps=eval_plans)
+            ai_b.params["num_simulations"] = eval_num_sim
+            ai_b.model = baseline
+        ai_a.model = current
+
+        while not board.game_over:
+            current_player = board.current_player
+            agent = ai_a if (current_player == GomokuBoard.BLACK if black_is_current else current_player == GomokuBoard.WHITE) else ai_b
+            move = agent.get_move(board)
             if move is None:
                 break
-            record.add_move(board.get_board_state(), move, current_player)
-            board.make_move(move[0], move[1])
-            moves_done += 1
-        record.set_winner(board.winner)
-        return record
+            board.make_move(*move)
 
-    def generate_training_data(self, num_games: int = 100) -> List[GameRecord]:
-        """生成训练数据"""
-        self.logger.info(f"Generating {num_games} self-play games...")
-        games = []
-        with _SilenceLogs(["neural_network", "ai_agent", __name__]):
-            for i in tqdm(range(num_games), desc="Self-play games", leave=True):
-                try:
-                    game = self.self_play_game()
-                    games.append(game)
-                    self.training_stats['games_played'] += 1
-                    self.training_stats['total_moves'] += game.game_length
-                except Exception as e:
-                    self.logger.error(f"Error in self-play game {i}: {e}")
-                    continue
-        self.logger.info(f"Generated {len(games)} games with {self.training_stats['total_moves']} total moves")
-        return games
-
-    def prepare_training_data(self, games: List[GameRecord], train_ratio: float = 0.8):
-        """准备训练数据"""
-        all_data = []
-        for game in games:
-            game_data = game.get_training_data()
-            all_data.extend(game_data)
-        random.shuffle(all_data)
-        split_idx = int(len(all_data) * train_ratio)
-        self.training_data = all_data[:split_idx]
-        self.validation_data = all_data[split_idx:]
-        self.logger.info(f"Training data: {len(self.training_data)} samples")
-        self.logger.info(f"Validation data: {len(self.validation_data)} samples")
-
-    def train_epoch(self) -> Dict[str, float]:
-        """训练一个epoch"""
-        self.model.train()
-        train_dataset = GomokuDataset(self.training_data)
-        train_loader = SimpleDataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
-        total_loss = 0
-        policy_loss_total = 0
-        value_loss_total = 0
-        for batch_idx, (board_states, move_indices, values) in enumerate(train_loader):
-            board_states = board_states.to(self.device)
-            move_indices = move_indices.to(self.device)
-            values = values.to(self.device)
-            self.optimizer.zero_grad()
-            policy_logits, value_pred = self.model(board_states)
-            policy_loss = nn.CrossEntropyLoss()(policy_logits, move_indices)
-            value_loss = nn.MSELoss()(value_pred.squeeze(), values)
-            # 调整损失权重，降低价值损失的影响
-            total_batch_loss = policy_loss + 0.5 * value_loss
-            total_batch_loss.backward()
-            # 梯度裁剪防止梯度爆炸
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            total_loss += total_batch_loss.item()
-            policy_loss_total += policy_loss.item()
-            value_loss_total += value_loss.item()
-        avg_loss = total_loss / len(train_loader)
-        avg_policy_loss = policy_loss_total / len(train_loader)
-        avg_value_loss = value_loss_total / len(train_loader)
-        return {'total_loss': avg_loss, 'policy_loss': avg_policy_loss, 'value_loss': avg_value_loss}
-
-    def validate(self) -> Dict[str, float]:
-        """验证模型"""
-        self.model.eval()
-        if not self.validation_data:
-            return {'total_loss': 0, 'policy_loss': 0, 'value_loss': 0}
-        val_dataset = GomokuDataset(self.validation_data)
-        val_loader = SimpleDataLoader(val_dataset, batch_size=self.batch_size, shuffle=False)
-        total_loss = 0
-        policy_loss_total = 0
-        value_loss_total = 0
-        with torch.no_grad():
-            for board_states, move_indices, values in val_loader:
-                board_states = board_states.to(self.device)
-                move_indices = move_indices.to(self.device)
-                values = values.to(self.device)
-                policy_logits, value_pred = self.model(board_states)
-                policy_loss = nn.CrossEntropyLoss()(policy_logits, move_indices)
-                value_loss = nn.MSELoss()(value_pred.squeeze(), values)
-                # 使用相同的损失权重
-                total_loss += (policy_loss + 0.5 * value_loss).item()
-                policy_loss_total += policy_loss.item()
-                value_loss_total += value_loss.item()
-        avg_loss = total_loss / len(val_loader)
-        avg_policy_loss = policy_loss_total / len(val_loader)
-        avg_value_loss = value_loss_total / len(val_loader)
-        return {'total_loss': avg_loss, 'policy_loss': avg_policy_loss, 'value_loss': avg_value_loss}
-
-    def _predict_policy_value(self, board_state: np.ndarray) -> Tuple[np.ndarray, float]:
-        """使用当前训练网络进行推理，返回策略与价值"""
-        if board_state.ndim == 2:
-            tensor = np.zeros((3, 15, 15), dtype=np.float32)
-            tensor[0] = (board_state == 1).astype(np.float32)
-            tensor[1] = (board_state == 2).astype(np.float32)
-            tensor[2] = (board_state == 0).astype(np.float32)
+        if board.winner is None:
+            draws += 1
         else:
-            tensor = board_state.astype(np.float32)
-        x = torch.from_numpy(tensor).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            policy_logits, value = self.model(x)
-            policy = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
-            value_f = value.squeeze().item()
-        return policy, value_f
-
-    def train(self, num_iterations: int = 10, games_per_iteration: int = 100, epochs_per_iteration: int = 5):
-        """训练模型"""
-        self.logger.info(f"Starting AlphaZero-Gomoku training for {num_iterations} iterations")
-        for iteration in range(num_iterations):
-            self.logger.info(f"Iteration {iteration + 1}/{num_iterations}")
-            self.training_stats['iterations'] = iteration + 1
-            games = self.generate_training_data(games_per_iteration)
-            self.prepare_training_data(games)
-            for epoch in range(epochs_per_iteration):
-                train_loss = self.train_epoch()
-                val_loss = self.validate()
-                self.training_stats['training_loss'].append(train_loss)
-                self.training_stats['validation_loss'].append(val_loss)
-                # 可视化已禁用
-                self.logger.info(f"Epoch {epoch + 1}: Train Loss = {train_loss['total_loss']:.4f}, Val Loss = {val_loss['total_loss']:.4f}")
-            self.scheduler.step()
-            if iteration % 2 == 0:
-                win_rate = self.evaluate_model(num_games=20)
-                self.training_stats['win_rate'].append(win_rate['win_rate'])
-                # 可视化已禁用
-                self._auto_save_model(iteration + 1, win_rate['win_rate'])
+            if board.winner == color_a:
+                wins += 1
             else:
-                self._auto_save_model(iteration + 1)
-            self.save_training_stats()
-        self.logger.info("Training completed!")
-        final_model_path = f"models/alphazero_gomoku_final.pth"
-        self.save_model(final_model_path)
-        self.logger.info(f"Final model saved to {final_model_path}")
-        # 可视化已禁用
+                losses += 1
 
-    def save_model(self, filepath: str):
-        """保存模型"""
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        torch.save({'model_state_dict': self.model.state_dict(), 'optimizer_state_dict': self.optimizer.state_dict(), 'scheduler_state_dict': self.scheduler.state_dict(), 'training_stats': self.training_stats, 'model_type': 'alphazero_gomoku'}, filepath)
-        self.logger.info(f"Model saved to {filepath}")
+        # 交替先手到下一局
+        black_is_current = not black_is_current
 
-    def save_training_stats(self):
-        """保存训练统计信息"""
-        stats_path = "data/training_stats.json"
-        os.makedirs(os.path.dirname(stats_path), exist_ok=True)
-        with open(stats_path, 'w') as f:
-            json.dump(self.training_stats, f, indent=2)
-        self.logger.info(f"Training stats saved to {stats_path}")
+    total = max(1, wins + losses + draws)
+    return {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / total}
 
-    def load_training_stats(self):
-        """加载训练统计信息"""
-        stats_path = "data/training_stats.json"
-        if os.path.exists(stats_path):
-            with open(stats_path, 'r') as f:
-                self.training_stats = json.load(f)
-            self.logger.info(f"Training stats loaded from {stats_path}")
 
-    def load_model(self, filepath: str):
-        """加载模型"""
-        if not os.path.exists(filepath):
-            self.logger.warning(f"Model file not found: {filepath}")
-            return
-        try:
-            checkpoint = torch.load(filepath, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            if 'optimizer_state_dict' in checkpoint:
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if 'scheduler_state_dict' in checkpoint:
-                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            if 'training_stats' in checkpoint:
-                self.training_stats = checkpoint['training_stats']
-            self.logger.info(f"Model loaded from {filepath}")
-        except Exception as e:
-            self.logger.error(f"Failed to load model: {e}")
+# ----------------------------
+# 训练一个 epoch
+# ----------------------------
 
-    def save_training_data(self, filepath: str):
-        """保存训练数据"""
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, 'wb') as f:
-            pickle.dump(self.training_data, f)
-        self.logger.info(f"Training data saved to {filepath}")
+def train_epoch(model: GomokuModel, loader: DataLoader, optimizer: optim.Optimizer, device: torch.device,
+                grad_clip: float = 1.0, epoch_index: int = 1, num_epochs: int = 1) -> float:
+    model.train_mode()
+    ce = nn.CrossEntropyLoss()
+    mse = nn.MSELoss()
+    total_loss = 0.0
+    batches = 0
 
-    def load_training_data(self, filepath: str):
-        """加载训练数据"""
-        if not os.path.exists(filepath):
-            self.logger.warning(f"Training data file not found: {filepath}")
-            return
-        with open(filepath, 'rb') as f:
-            self.training_data = pickle.load(f)
-        self.logger.info(f"Training data loaded from {filepath}")
+    total_batches = len(loader)
+    processed = 0
+    for x, y_policy, y_value in loader:
+        x = x.to(device)
+        y_policy = y_policy.to(device)
+        y_value = y_value.to(device)
 
-    def evaluate_model(self, num_games: int = 20) -> Dict[str, float]:
-        """评估模型"""
-        self.logger.info(f"Evaluating model with {num_games} games...")
+        optimizer.zero_grad()
+        policy_logits, value_pred = model.model(x)
+        loss_policy = ce(policy_logits, y_policy)
+        loss_value = mse(value_pred, y_value)
+        loss = loss_policy + loss_value
+        loss.backward()
+        if grad_clip is not None and grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.model.parameters(), grad_clip)
+        optimizer.step()
+
+        total_loss += float(loss.item())
+        batches += 1
+        processed += 1
+        # Epoch级别进度条（单条）
+        pct = processed / max(1, total_batches)
+        bar = _render_bar(pct, width=12)
+        print(f"\r    ├── 模型训练: {bar} {int(pct*100)}% (epoch {epoch_index}/{num_epochs})", end="")
+
+    print("")
+    return total_loss / max(1, batches)
+
+
+def validate_epoch(model: GomokuModel, loader: DataLoader, device: torch.device, epoch_index: int = 1, num_epochs: int = 1) -> float:
+    model.eval_mode()
+    ce = nn.CrossEntropyLoss()
+    mse = nn.MSELoss()
+    total_loss = 0.0
+    batches = 0
+    total_batches = len(loader)
+    processed = 0
+    with torch.no_grad():
+        for x, y_policy, y_value in loader:
+            x = x.to(device)
+            y_policy = y_policy.to(device)
+            y_value = y_value.to(device)
+            policy_logits, value_pred = model.model(x)
+            loss = ce(policy_logits, y_policy) + mse(value_pred, y_value)
+            total_loss += float(loss.item())
+            batches += 1
+            processed += 1
+            # 验证进度条（单条）
+            pct = processed / max(1, total_batches)
+            bar = _render_bar(pct, width=12)
+            print(f"\r    ├── 验证中:   {bar} {int(pct*100)}% (epoch {epoch_index}/{num_epochs})", end="")
+    print("")
+    return total_loss / max(1, batches)
+
+
+# ----------------------------
+# 进度渲染工具
+# ----------------------------
+
+def _render_bar(pct: float, width: int = 20) -> str:
+    pct = max(0.0, min(1.0, pct))
+    filled = int(pct * width)
+    empty = width - filled
+    return "█" * filled + "░" * empty
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h}小时{m}分"
+
+
+# ----------------------------
+# 主流程
+# ----------------------------
+
+def main():
+    device = torch.device("cpu")
+    os.makedirs("models", exist_ok=True)
+
+    print("🚀 开始 AlphaZero 五子棋训练")
+    print("=" * 50)
+    print(f"设备: {device}")
+    print(f"模型目录: {os.path.abspath('models')}")
+
+    # 加载或初始化模型（内部会优先 best -> 最新 -> 随机）
+    print("📦 加载模型中...")
+    model = GomokuModel(model_path=None, board_size=15, device=str(device))
+    print("✅ 模型加载完成")
+
+    # 训练配置（CPU 友好）
+    iterations = 6            # 总迭代轮数
+    games_per_iteration = 10  # 每轮自我对弈局数（减小以提速）
+    train_split = 0.9         # 更多样本用于训练
+    batch_size = 128         # 批次
+    learning_rate = 8e-4
+    grad_clip = 0.8
+
+    print(f"训练配置: {iterations}轮迭代, 每轮{games_per_iteration}局对弈")
+    print("=" * 50)
+
+    # 优化与调度
+    optimizer = optim.Adam(model.model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.85)
+
+    # 早停机制
+    patience = 3
+    best_val = math.inf
+    patience_count = 0
+
+    # 评估用基线（上一轮最佳的快照）
+    best_model_snapshot: Optional[GomokuModel] = None
+
+    t0 = time.time()
+
+
+    for it in range(1, iterations + 1):
+        # 阶段一：自我对弈数据生成（带时间限制）
+        ai_black = AlphaZeroGomokuAI(GomokuBoard.BLACK, difficulty="medium", device=str(device), 
+                                    time_limit=5.0, time_reward_factor=0.1)
+        ai_white = AlphaZeroGomokuAI(GomokuBoard.WHITE, difficulty="medium", device=str(device),
+                                    time_limit=5.0, time_reward_factor=0.1)
+        ai_black.model = model
+        ai_white.model = model
+
+        replay = SimpleReplay()
+        finished_games = 0
+        total_moves_acc = 0
+        # 自我对弈进度（带超时保护）
+        print(f"🔄 迭代 {it}/{iterations} - 阶段一：自我对弈数据生成")
+        for g in range(games_per_iteration):
+            buf, glen = play_one_game(ai_black, ai_white, step_timeout=8.0, game_timeout=180.0)
+            replay.states.extend(buf.states)
+            replay.move_indices.extend(buf.move_indices)
+            replay.players.extend(buf.players)
+            replay.outcomes.extend(buf.outcomes)
+            finished_games += 1
+            total_moves_acc += glen
+            pg_pct = finished_games / games_per_iteration
+            bar = _render_bar(pg_pct, width=20)
+            avg_moves = int(total_moves_acc/max(1,finished_games))
+            print(f"\r    ├── 自我对弈: {bar} {int(pg_pct*100)}% ({finished_games}/{games_per_iteration}局) 平均步数≈{avg_moves}", end="")
+        print("")
+
+        # 阶段二：数据加载与训练（含增强与验证）
+        dataset = GomokuSelfPlayDataset(replay, use_augmentation=True, augment_ratio=0.35)
+        if len(dataset) < 8:
+            print("自我对弈样本过少，跳过本轮训练。")
+            continue
+        # 划分训练/验证
+        n = len(dataset)
+        idx = list(range(n))
+        random.shuffle(idx)
+        split = int(n * train_split)
+        train_idx = idx[:split]
+        val_idx = idx[split:]
+
+        class Subset(Dataset):
+            def __init__(self, base: Dataset, indices: List[int]):
+                self.base = base
+                self.indices = indices
+    
+    def __len__(self):
+                return len(self.indices)
+
+            def __getitem__(self, i):
+                return self.base[self.indices[i]]
+
+        train_loader = DataLoader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(Subset(dataset, val_idx), batch_size=batch_size, shuffle=False)
+
+        # 训练若干 epoch（这里每轮 2 次），每个epoch显示单条进度条
+        train_losses = []
+        val_losses = []
+        epochs = 2
+        for ep in range(epochs):
+            # 这里在 train_epoch 内显示批次条；此处显示总体epoch进度
+            train_loss = train_epoch(model, train_loader, optimizer, device, grad_clip=grad_clip, epoch_index=ep+1, num_epochs=epochs)
+            val_loss = validate_epoch(model, val_loader, device, epoch_index=ep+1, num_epochs=epochs)
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+            ep_pct = (ep + 1) / epochs
+            ep_bar = _render_bar(ep_pct, width=12)
+            print(f"    ├── 模型训练: {ep_bar} {int(ep_pct*100)}% (epoch {ep+1}/{epochs})")
+        avg_train = float(np.mean(train_losses))
+        avg_val = float(np.mean(val_losses))
+
+        # 学习率调度
+        scheduler.step()
+
+        # 保存当前迭代模型
+        iter_path = os.path.join("models", f"alphazero_gomoku_iter_{it}.pth")
+        model.save_model(iter_path)
+
+        # 早停与最佳模型维护（以验证损失为准）
+        improved = avg_val < best_val
+        if improved:
+            best_val = avg_val
+            patience_count = 0
+            best_path = os.path.join("models", "alphazero_gomoku_best.pth")
+            model.save_model(best_path)
+            # 复制快照用于评估对局
+            best_model_snapshot = GomokuModel(model_path=best_path, board_size=15, device=str(device))
+        else:
+            patience_count += 1
+
+        # 阶段三：模型评估（对战评估）
+        # 评估进度（按对局数显示）
+        eval_games = 6
         wins = 0
         losses = 0
         draws = 0
-        with _SilenceLogs(["neural_network", "ai_agent", __name__]):
-            for i in tqdm(range(num_games), desc="Evaluation games", leave=True):
-                test_ai = AlphaZeroGomokuAI(1, "medium")
-                board = GomokuBoard()
-                while not board.game_over:
-                    if board.current_player == 1:
-                        policy, value = self._predict_policy_value(board.get_board_state())
-                        valid_moves = board.get_valid_moves()
-                        if valid_moves:
-                            best_move = None
-                            best_prob = -1
-                            for move in valid_moves:
-                                move_idx = move[0] * 15 + move[1]
-                                if policy[move_idx] > best_prob:
-                                    best_prob = policy[move_idx]
-                                    best_move = move
-                            if best_move:
-                                board.make_move(best_move[0], best_move[1])
-                    else:
-                        move = test_ai.get_move(board)
-                        if move:
-                            board.make_move(move[0], move[1])
-            if board.winner == 1:
-                wins += 1
-            elif board.winner == 2:
-                losses += 1
-            else:
-                draws += 1
-        win_rate = wins / num_games
-        self.training_stats['win_rate'].append(win_rate)
-        self.logger.info(f"Evaluation results: {wins} wins, {losses} losses, {draws} draws")
-        self.logger.info(f"Win rate: {win_rate:.2%}")
-        return {'wins': wins, 'losses': losses, 'draws': draws, 'win_rate': win_rate}
+        for eg in range(eval_games):
+            # 单局评估
+            stats = evaluate_model(model, best_model_snapshot, device=device, games=1)
+            wins += stats.get('wins', 0)
+            losses += stats.get('losses', 0)
+            draws += stats.get('draws', 0)
+            pct = (eg + 1) / eval_games
+            bar = _render_bar(pct, width=12)
+            print(f"\r    └── 模型评估: {bar} {int(pct*100)}% ({eg+1}/{eval_games})", end="")
+        print("")
+        total = max(1, wins + losses + draws)
+        eval_stats = {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / total}
 
-class SimpleDataLoader:
-    """轻量级DataLoader，避免触发torch.distributed导入"""
-    def __init__(self, dataset: Dataset, batch_size: int = 16, shuffle: bool = True):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
+        # 顶部总体进度与时间估计
+        overall_pct = it / iterations
+        elapsed = time.time() - t0
+        eta = (elapsed / max(1e-6, overall_pct)) * (1 - overall_pct)
+        overall_bar = _render_bar(overall_pct, width=20)
+        avg_game_len = int(total_moves_acc / max(1, finished_games))
+        print(f"📊 总体进度: {overall_bar} {int(overall_pct*100)}%")
+        print(f"    ⏱️  已运行: {_fmt_duration(elapsed)} | 预计剩余: {_fmt_duration(eta)}")
+        print(f"\n    🔄 当前阶段: 模型训练 (迭代 {it}/{iterations})")
+        print(f"    ├── 自我对弈: ✅ 完成 ({finished_games}/{games_per_iteration}局)")
+        print(f"    ├── 模型训练: ✅ 完成 (epoch {epochs}/{epochs})")
+        print(f"    └── 模型评估: ✅ 完成")
 
-    def __len__(self):
-        import math
-        return 0 if len(self.dataset) == 0 else math.ceil(len(self.dataset) / self.batch_size)
+        # 性能指标展示（无 Elo 估计则省略增量，仅显示当前）
+        wr = eval_stats.get('win_rate', 0.0) * 100.0
+        print("\n    📈 性能指标:")
+        print(f"    ├── 胜率: {wr:.1f}%")
+        print(f"    ├── 平均游戏长度: {avg_game_len}步")
+        print(f"    └── 损失值: {avg_val:.3f}")
 
-    def __iter__(self):
-        indices = list(range(len(self.dataset)))
-        if self.shuffle:
-            random.shuffle(indices)
-        for start in range(0, len(indices), self.batch_size):
-            batch_indices = indices[start:start + self.batch_size]
-            items = [self.dataset[i] for i in batch_indices]
-            if not items:
-                continue
-            board_states = torch.stack([it[0] for it in items], dim=0)
-            move_indices = torch.stack([it[1] for it in items], dim=0)
-            values = torch.stack([it[2] for it in items], dim=0)
-            yield board_states, move_indices, values
+        if patience_count >= patience:
+            print("触发早停条件，结束训练。")
+            break
 
-
-class GomokuDataset(Dataset):
-    """五子棋数据集"""
-    
-    def __init__(self, data: List[Tuple[np.ndarray, int, float]]):
-        self.data = data
-    
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        board_state, move_index, value = self.data[idx]
-        
-        # 确保输入为 (3, 15, 15) 三通道
-        if board_state.ndim == 2:
-            tensor = np.zeros((3, 15, 15), dtype=np.float32)
-            tensor[0] = (board_state == 1).astype(np.float32)
-            tensor[1] = (board_state == 2).astype(np.float32)
-            tensor[2] = (board_state == 0).astype(np.float32)
-        else:
-            tensor = board_state.astype(np.float32)
-        board_tensor = torch.from_numpy(tensor)
-        move_tensor = torch.tensor(move_index, dtype=torch.long)
-        value_tensor = torch.tensor(value, dtype=torch.float)
-        
-        return board_tensor, move_tensor, value_tensor
-
-
-def train_gomoku_model():
-    """训练五子棋模型的主函数"""
-    print("Starting Gomoku AI Training...")
-    
-    # 创建训练器
-    trainer = SelfPlayTrainer()
-    
-    # 开始训练
-    trainer.train(
-        num_iterations=5,
-        games_per_iteration=50,
-        epochs_per_iteration=3,
-    )
-    
-    # 评估模型
-    trainer.evaluate_model(num_games=10)
-    
-    print("Training completed!")
+    # 最终保存
+    final_path = os.path.join("models", "alphazero_gomoku_final.pth")
+    model.save_model(final_path)
+    print(f"Saved final model to {final_path}")
 
 
 if __name__ == "__main__":
-    train_gomoku_model()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n⚠️ 训练被用户中断")
+    except Exception as e:
+        print(f"\n\n❌ 训练过程中出现错误: {e}")
+        import traceback
+        traceback.print_exc()

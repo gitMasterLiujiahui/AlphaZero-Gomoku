@@ -15,6 +15,7 @@ import time
 from typing import List, Tuple, Optional, Dict, Any
 from gomoku_board import GomokuBoard
 from neural_network import GomokuModel
+from bg_planner import BGPlannerAI, KnowledgeSearch
 import torch
 import logging
 
@@ -25,47 +26,77 @@ class AlphaZeroGomokuAI:
     基于深度学习和蒙特卡洛树搜索的AI算法
     """
     
-    def __init__(self, player: int, difficulty: str = "medium", model_path: Optional[str] = None):
+    def __init__(self, player: int, difficulty: str = "medium", model_path: Optional[str] = None,
+                 device: Optional[str] = None, beta: float = 0.2, planner_steps: int = 5,
+                 time_limit: float = 5.0, time_reward_factor: float = 0.1):
         """
         初始化AlphaZero-Gomoku AI
         参数:
             player: 玩家编号 (1=黑子, 2=白子)
             difficulty: 难度级别 ("easy", "medium", "hard")
             model_path: 预训练模型路径，如果为None则自动加载最新模型
+            device: 可选计算设备（保持向后兼容）。None时默认"cpu"。
+            beta: 选择阶段加入BG评分的权重系数
+            planner_steps: 模拟阶段前k步使用BG-Planner引导
+            time_limit: 单步决策时间限制（秒）
+            time_reward_factor: 时间奖励因子，快速决策获得奖励
         """
         self.player = player
         self.difficulty = difficulty
         self.name = f"AlphaZero_{difficulty}"
+        self.device = torch.device(device if device is not None else "cpu")
+        self.beta = float(beta)
+        self.planner_steps = int(max(0, planner_steps))
+        self.time_limit = float(time_limit)
+        self.time_reward_factor = float(time_reward_factor)
         
         # 设置日志
         self.logger = logging.getLogger(__name__)
         
         # 创建神经网络模型（不自动加载以避免结构不一致报错）
-        self.model = GomokuModel(model_path=model_path)
+        self.model = GomokuModel(model_path=model_path, device=str(self.device))
+
+        # 轻量BG组件
+        self.bg_planner = BGPlannerAI(player=self.player, difficulty=self.difficulty, device=str(self.device))
+        self.knowledge_search = KnowledgeSearch(board_size=15)
         
-        # 难度参数配置
+        # 难度参数配置（融合版）
+        # 说明：如用户未传 device，则使用难度默认设备；保持向后兼容
         self.difficulty_params = {
             "easy": {
-                "simulations": 50,
-                "temperature": 1.5,
-                "exploration": 0.2,
-                "c_puct": 1.2
+                "device": "cpu",
+                "bg_weight": 0.1,          # β: 规划影响
+                "planning_steps": 2,       # 前k步由规划引导
+                "num_simulations": 100,    # MCTS模拟次数
+                "c_puct": 1.4,
+                "exploration": 0.2
             },
             "medium": {
-                "simulations": 100,
-                "temperature": 0.8,
-                "exploration": 0.05,
-                "c_puct": 1.6
+                "device": "cpu",
+                "bg_weight": 0.2,
+                "planning_steps": 3,
+                "num_simulations": 200,
+                "c_puct": 1.6,
+                "exploration": 0.05
             },
             "hard": {
-                "simulations": 200,
-                "temperature": 0.3,
-                "exploration": 0.01,
-                "c_puct": 1.8
+                "device": "cpu",
+                "bg_weight": 0.25,
+                "planning_steps": 4,
+                "num_simulations": 400,
+                "c_puct": 1.8,
+                "exploration": 0.01
             }
         }
-        
+
         self.params = self.difficulty_params.get(difficulty, self.difficulty_params["medium"])
+
+        # 如未显式传入device，则采用难度默认设备
+        if device is None and "device" in self.params:
+            self.device = torch.device(self.params["device"])  # 覆盖默认cpu
+            # 需要将模型与规划器迁移到该设备
+            self.model = GomokuModel(model_path=model_path, device=str(self.device))
+            self.bg_planner = BGPlannerAI(player=self.player, difficulty=self.difficulty, device=str(self.device))
         
         # MCTS相关
         self.mcts_root = None
@@ -136,15 +167,33 @@ class AlphaZeroGomokuAI:
     
     def _mcts_search(self, board: GomokuBoard, valid_moves: List[Tuple[int, int]]) -> Tuple[int, int]:
         """
-        蒙特卡洛树搜索
+        蒙特卡洛树搜索（带超时保护）
         结合神经网络进行策略搜索
         """
-        # 创建MCTS根节点
-        root = MCTSNode(board, None, None, self.model, self.params)
+        start_time = time.time()
         
-        # 运行MCTS搜索
-        for _ in range(self.params["simulations"]):
+        # 创建MCTS根节点
+        root = MCTSNode(board, None, None, self.model, self.params,
+                        bg_beta=self.beta, bg_scorer=self._bg_score, current_player=self.player)
+        
+        # 运行MCTS搜索（带时间限制）
+        simulations = 0
+        max_simulations = self.params.get("num_simulations", 200)
+        
+        for _ in range(max_simulations):
+            current_time = time.time()
+            elapsed = current_time - start_time
+            
+            # 时间超时保护
+            if elapsed > self.time_limit:
+                break
+                
             self._mcts_simulation(root)
+            simulations += 1
+        
+        # 记录决策时间用于奖励计算
+        decision_time = time.time() - start_time
+        self._last_decision_time = decision_time
         
         # 选择最佳移动
         if root.children:
@@ -193,26 +242,122 @@ class AlphaZeroGomokuAI:
         child_board = node.board.copy_board()
         child_board.make_move(move[0], move[1])
         
-        child = MCTSNode(child_board, node, move, self.model, self.params)
+        child = MCTSNode(child_board, node, move, self.model, self.params,
+                         bg_beta=self.beta, bg_scorer=self._bg_score, current_player=self.player)
         node.children.append(child)
         
         return child
     
     def _simulate(self, node: 'MCTSNode') -> float:
         """
-        模拟阶段：使用神经网络评估局面价值
+        模拟阶段（规划引导模拟 + 进攻性策略）：
+        - 前k步采用BG-Planner引导
+        - 其后采用进攻性随机走子，优先选择能获胜或阻止对手获胜的着法
         """
+        # 终局直接返回结果
         if node.is_terminal():
-            if node.board.winner == self.player:
-                return 1.0
-            elif node.board.winner is not None:
-                return -1.0
-            else:
-                return 0.0
+            return self._get_terminal_value(node.board)
+
+        rollout_board = node.board.copy_board()
+        max_depth = 100
+        steps = 0
         
-        # 使用神经网络评估局面
-        _, value = node.model.predict(node.board.get_board_state())
-        return value
+        # 规划引导的前k步
+        while (not rollout_board.game_over) and steps < self.planner_steps:
+            mv = self.bg_planner.get_move(rollout_board)
+            if mv is None:
+                break
+            rollout_board.make_move(mv[0], mv[1])
+            steps += 1
+
+        # 进攻性随机走子直到终局或达到深度限制
+        while (not rollout_board.game_over) and steps < max_depth:
+            vms = rollout_board.get_valid_moves()
+            if not vms:
+                break
+                
+            # 优先选择进攻性着法
+            move = self._select_offensive_move(rollout_board, vms)
+            rollout_board.make_move(*move)
+            steps += 1
+
+        # 使用统一的终端价值判断
+        return self._get_terminal_value(rollout_board)
+
+    def _get_terminal_value(self, board: GomokuBoard) -> float:
+        """
+        获取终端节点的价值
+        参数:
+            board: 棋盘状态
+        返回:
+            float: 终端价值 (1.0=AI胜, -1.0=AI负, 0.0=平局)
+        """
+        if not board.game_over:
+            return 0.0
+            
+        if board.winner == self.player:
+            return 1.0
+        elif board.winner is not None:
+            return -1.0
+        else:
+            # 平局情况，给予轻微惩罚鼓励进攻
+            return -0.2
+
+    def _select_offensive_move(self, board: GomokuBoard, valid_moves: List[Tuple[int, int]]) -> Tuple[int, int]:
+        """
+        选择进攻性着法
+        优先选择能立即获胜或阻止对手获胜的着法
+        """
+        current_player = board.current_player
+        opponent = GomokuBoard.WHITE if current_player == GomokuBoard.BLACK else GomokuBoard.BLACK
+        
+        # 1. 优先选择能立即获胜的着法
+        for move in valid_moves:
+            test_board = board.copy_board()
+            test_board.make_move(move[0], move[1])
+            if test_board.game_over and test_board.winner == current_player:
+                return move
+        
+        # 2. 优先选择能阻止对手获胜的着法
+        for move in valid_moves:
+            test_board = board.copy_board()
+            test_board.make_move(move[0], move[1])
+            if test_board.game_over and test_board.winner == opponent:
+                return move
+        
+        # 3. 优先选择中心区域和关键位置的着法
+        center = board.BOARD_SIZE // 2
+        center_moves = []
+        extended_center_moves = []
+        edge_moves = []
+        
+        for move in valid_moves:
+            r, c = move
+            dist_from_center = abs(r - center) + abs(c - center)
+            
+            if dist_from_center <= 2:
+                center_moves.append(move)
+            elif dist_from_center <= 4:
+                extended_center_moves.append(move)
+            else:
+                edge_moves.append(move)
+        
+        # 按优先级选择
+        if center_moves:
+            return random.choice(center_moves)
+        elif extended_center_moves:
+            return random.choice(extended_center_moves)
+        else:
+            return random.choice(edge_moves)
+
+    def _bg_score(self, board: GomokuBoard, player: int) -> float:
+        """计算BG规划评分，做轻度归一化以便与UCT相加。"""
+        try:
+            score = self.knowledge_search._pattern_score(board, player)
+            # 将大幅度启发式分数压缩到[-1,1]附近
+            return float(np.tanh(score / 10000.0))
+        except Exception:
+            return 0.0
     
     def _backpropagate(self, node: 'MCTSNode', value: float):
         """
@@ -268,7 +413,8 @@ class MCTSNode:
     """
     
     def __init__(self, board: GomokuBoard, parent: Optional['MCTSNode'], 
-                 move: Optional[Tuple[int, int]], model: GomokuModel, params: Dict[str, Any]):
+                 move: Optional[Tuple[int, int]], model: GomokuModel, params: Dict[str, Any],
+                 bg_beta: float = 0.0, bg_scorer: Optional[Any] = None, current_player: int = 1):
         """
         初始化MCTS节点
         参数:
@@ -283,6 +429,9 @@ class MCTSNode:
         self.move = move
         self.model = model
         self.params = params
+        self.bg_beta = float(bg_beta)
+        self.bg_scorer = bg_scorer
+        self.current_player = current_player
         
         # MCTS统计信息
         self.children = []
@@ -303,20 +452,35 @@ class MCTSNode:
     
     def ucb1(self) -> float:
         """
-        计算UCB1值
-        用于选择最佳子节点
-        返回: UCB1值
+        计算增强后的选择分数：UCT + beta * BG_Score
         """
         if self.visits == 0:
-            return float('inf')
+            base = float('inf')
+        else:
+            exploitation = self.value / self.visits
+            exploration = self.params["c_puct"] * np.sqrt(max(1.0, np.log(max(1, self.parent.visits))) / self.visits)
+            base = exploitation + exploration
+
+        # BG规划奖励
+        bg_bonus = 0.0
+        if self.bg_scorer is not None:
+            try:
+                bg_bonus = self.bg_beta * float(self.bg_scorer(self.board, self.current_player))
+            except Exception:
+                bg_bonus = 0.0
         
-        # 利用项：平均价值
-        exploitation = self.value / self.visits
+        # 时间奖励（快速决策获得奖励）
+        time_reward = 0.0
+        if hasattr(self.model, '_last_decision_time') and self.model._last_decision_time is not None:
+            # 快速决策（<1秒）获得奖励，慢速决策（>3秒）受到惩罚
+            decision_time = self.model._last_decision_time
+            if decision_time < 1.0:
+                time_reward = 0.1  # 快速决策奖励
+            elif decision_time > 3.0:
+                time_reward = -0.05  # 慢速决策惩罚
         
-        # 探索项：基于访问次数的不确定性
-        exploration = self.params["c_puct"] * np.sqrt(np.log(self.parent.visits) / self.visits)
-        
-        return exploitation + exploration
+        # 若base为inf（未访问节点），仍返回inf确保探索优先
+        return base if base == float('inf') else base + bg_bonus + time_reward
     
     def _get_prior_probability(self) -> np.ndarray:
         """
@@ -346,20 +510,22 @@ class AIFactory:
     """
     
     @staticmethod
-    def create_ai(ai_type: str, player: int, difficulty: str = "medium", **kwargs) -> AlphaZeroGomokuAI:
+    def create_ai(ai_type: str, player: int, difficulty: str = "medium", **kwargs):
         """
         创建AlphaZero-Gomoku AI实例
         参数:
-            ai_type: AI类型（只支持"alphazero"）
+            ai_type: AI类型（"alphazero" 或 "bg_planner"）
             player: 玩家编号 (1=黑子, 2=白子)
             difficulty: 难度级别 ("easy", "medium", "hard")
             **kwargs: 其他参数，包括model_path等
-        返回: AlphaZero-Gomoku AI实例
+        返回: AI实例
         """
-        if ai_type != "alphazero":
-            raise ValueError(f"Only 'alphazero' AI type is supported, got: {ai_type}")
-        
-        return AlphaZeroGomokuAI(player, difficulty, **kwargs)
+        if ai_type == "alphazero":
+            return AlphaZeroGomokuAI(player, difficulty, **kwargs)
+        if ai_type == "bg_planner":
+            device = kwargs.get('device', 'cpu')
+            return BGPlannerAI(player, difficulty, device=device)
+        raise ValueError(f"Unsupported ai_type: {ai_type}")
     
     @staticmethod
     def get_available_ai_types() -> List[str]:
@@ -367,7 +533,7 @@ class AIFactory:
         获取可用的AI类型
         返回: AI类型列表（目前只有AlphaZero）
         """
-        return ["alphazero"]
+        return ["alphazero", "bg_planner"]
     
     @staticmethod
     def get_available_difficulties() -> List[str]:

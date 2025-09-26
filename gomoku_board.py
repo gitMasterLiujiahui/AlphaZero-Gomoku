@@ -103,7 +103,7 @@ class GomokuBoard:
         if self.check_win(row, col):
             self.game_over = True
             self.winner = self.current_player
-        elif self.is_board_full():
+        elif self.is_board_full() or self.get_move_count() >= 200:  # 增加步数限制避免过长对局
             self.game_over = True
             self.winner = None  # 平局
         

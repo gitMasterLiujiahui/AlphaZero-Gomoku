@@ -1,6 +1,21 @@
-*.md
-*.idea/
+__pycache__/
+*.pyc
+
+# Logs
 *.log
-*.txt
-*data/
-*__pycache__/
+training.log
+gomoku.log
+
+# Models (keep directory, ignore weights)
+models/*.pth
+
+# Editors/OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Caches
+*.cache/
+
+

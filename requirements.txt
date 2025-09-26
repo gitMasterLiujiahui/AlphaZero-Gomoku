@@ -1,0 +1,6 @@
+torch==2.1.2+cpu ; platform_system == "Windows"
+torchvision==0.16.2+cpu ; platform_system == "Windows"
+numpy<2.0
+pygame>=2.1.0
+# 移除可视化依赖，避免额外资源占用
+tqdm>=4.64.0
