@@ -300,13 +300,13 @@ class AlphaZeroGomokuAI:
         elif board.winner is not None:
             return -1.0
         else:
-            # 平局情况，给予轻微惩罚鼓励进攻
-            return -0.2
+            # 平局情况，给予轻微奖励鼓励积极对弈
+            return 0.1
 
     def _select_offensive_move(self, board: GomokuBoard, valid_moves: List[Tuple[int, int]]) -> Tuple[int, int]:
         """
         选择进攻性着法
-        优先选择能立即获胜或阻止对手获胜的着法
+        优先选择能立即获胜或阻止对手获胜的着法，包含防守逻辑
         """
         current_player = board.current_player
         opponent = GomokuBoard.WHITE if current_player == GomokuBoard.BLACK else GomokuBoard.BLACK
@@ -325,7 +325,17 @@ class AlphaZeroGomokuAI:
             if test_board.game_over and test_board.winner == opponent:
                 return move
         
-        # 3. 优先选择中心区域和关键位置的着法
+        # 3. 防守逻辑：检查对手的连三、连四威胁
+        defensive_moves = self._find_defensive_moves(board, valid_moves, opponent)
+        if defensive_moves:
+            return random.choice(defensive_moves)
+        
+        # 4. 进攻逻辑：寻找自己的连三、连四机会
+        offensive_moves = self._find_offensive_moves(board, valid_moves, current_player)
+        if offensive_moves:
+            return random.choice(offensive_moves)
+        
+        # 5. 优先选择中心区域和关键位置的着法
         center = board.BOARD_SIZE // 2
         center_moves = []
         extended_center_moves = []
@@ -349,6 +359,75 @@ class AlphaZeroGomokuAI:
             return random.choice(extended_center_moves)
         else:
             return random.choice(edge_moves)
+
+    def _find_defensive_moves(self, board: GomokuBoard, valid_moves: List[Tuple[int, int]], opponent: int) -> List[Tuple[int, int]]:
+        """
+        寻找防守着法：堵截对手的连三、连四威胁
+        """
+        defensive_moves = []
+        
+        for move in valid_moves:
+            # 模拟下这步棋
+            test_board = board.copy_board()
+            test_board.make_move(move[0], move[1])
+            
+            # 检查对手是否能形成威胁
+            threat_level = self._evaluate_threat_level(test_board, opponent)
+            
+            # 如果这步棋能有效阻止对手威胁，加入防守列表
+            if threat_level >= 3:  # 连三或以上威胁
+                defensive_moves.append(move)
+        
+        return defensive_moves
+    
+    def _find_offensive_moves(self, board: GomokuBoard, valid_moves: List[Tuple[int, int]], current_player: int) -> List[Tuple[int, int]]:
+        """
+        寻找进攻着法：寻找自己的连三、连四机会
+        """
+        offensive_moves = []
+        
+        for move in valid_moves:
+            # 模拟下这步棋
+            test_board = board.copy_board()
+            test_board.make_move(move[0], move[1])
+            
+            # 检查自己是否能形成威胁
+            threat_level = self._evaluate_threat_level(test_board, current_player)
+            
+            # 如果这步棋能形成威胁，加入进攻列表
+            if threat_level >= 3:  # 连三或以上威胁
+                offensive_moves.append(move)
+        
+        return offensive_moves
+    
+    def _evaluate_threat_level(self, board: GomokuBoard, player: int) -> int:
+        """
+        评估威胁等级
+        返回: 0-5，数字越大威胁越大
+        """
+        max_threat = 0
+        
+        # 检查所有方向
+        for direction in board.DIRECTIONS:
+            for row in range(board.BOARD_SIZE):
+                for col in range(board.BOARD_SIZE):
+                    if board.board[row, col] == player:
+                        # 计算这个方向上的连续棋子数
+                        count = 1
+                        count += board._count_consecutive(row, col, direction, player)
+                        count += board._count_consecutive(row, col, (-direction[0], -direction[1]), player)
+                        
+                        # 更新最大威胁等级
+                        if count >= 5:
+                            max_threat = max(max_threat, 5)  # 五连
+                        elif count >= 4:
+                            max_threat = max(max_threat, 4)  # 四连
+                        elif count >= 3:
+                            max_threat = max(max_threat, 3)  # 三连
+                        elif count >= 2:
+                            max_threat = max(max_threat, 2)  # 二连
+        
+        return max_threat
 
     def _bg_score(self, board: GomokuBoard, player: int) -> float:
         """计算BG规划评分，做轻度归一化以便与UCT相加。"""

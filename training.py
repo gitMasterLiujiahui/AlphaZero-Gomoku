@@ -180,7 +180,7 @@ def play_one_game(ai_black: AlphaZeroGomokuAI, ai_white: AlphaZeroGomokuAI,
                 valid_moves = board.get_valid_moves()
                 if valid_moves:
                     move = random.choice(valid_moves)
-        else:
+                else:
                     break
             elif step_elapsed > 3.0:
                 slow_steps += 1
@@ -194,7 +194,7 @@ def play_one_game(ai_black: AlphaZeroGomokuAI, ai_white: AlphaZeroGomokuAI,
             valid_moves = board.get_valid_moves()
             if valid_moves:
                 move = random.choice(valid_moves)
-                else:
+            else:
                 break
         
         if move is None:
@@ -444,7 +444,7 @@ def main():
                 self.base = base
                 self.indices = indices
     
-    def __len__(self):
+            def __len__(self):
                 return len(self.indices)
 
             def __getitem__(self, i):

@@ -104,6 +104,7 @@ class GomokuUI:
         # UI状态
         self.selected_difficulty = "medium"
         self.selected_ai_type = "alphazero"
+        self.selected_color = "black"   # 人类玩家选择的颜色
         self.show_menu = True
         self.show_settings = False
         self.game_started = False
@@ -138,19 +139,27 @@ class GomokuUI:
         self.game_mode = game_mode
         self.difficulty = difficulty
         
+        # 根据用户选择设置人类玩家颜色
+        if self.selected_color == "black":
+            self.human_player = GomokuBoard.BLACK
+        else:
+            self.human_player = GomokuBoard.WHITE
+        
         # 重置棋盘
         self.board.reset()
         
         # 创建AlphaZero AI
         if game_mode in ["human_vs_ai", "ai_vs_ai"]:
-            self.ai_player = AIFactory.create_ai(self.ai_type, GomokuBoard.WHITE, difficulty, device="cpu")
+            # AI使用与人类相反的颜色
+            ai_color = GomokuBoard.WHITE if self.human_player == GomokuBoard.BLACK else GomokuBoard.BLACK
+            self.ai_player = AIFactory.create_ai(self.ai_type, ai_color, difficulty, device="cpu")
         
         self.show_menu = False
         self.show_settings = False
         self.game_started = True
         
         # 如果AI先手，让AI下第一步
-        if game_mode == "ai_vs_ai" or (game_mode == "human_vs_ai" and self.human_player == GomokuBoard.WHITE):
+        if game_mode == "ai_vs_ai" or (game_mode == "human_vs_ai" and self.ai_player.player == GomokuBoard.BLACK):
             self._make_ai_move()
     
     def _make_ai_move(self):
@@ -264,6 +273,14 @@ class GomokuUI:
                 if 180 <= x <= 340 and ty <= y <= ty + 24:
                     self.selected_ai_type = t
                     self.ai_type = t
+                    return True
+            
+            # 颜色选择点击
+            colors = ["black", "white"]
+            for i, color in enumerate(colors):
+                color_y = 350 + i * 40
+                if 100 <= x <= 300 and color_y <= y <= color_y + 30:
+                    self.selected_color = color
                     return True
         
         return False
@@ -416,6 +433,24 @@ class GomokuUI:
             pygame.draw.rect(self.screen, Colors.BLACK, rect, 2)
             txt = self.font_small.render(t, True, Colors.BLACK)
             self.screen.blit(txt, txt.get_rect(center=rect.center))
+        
+        # 颜色选择
+        color_title = self.font_medium.render("执子颜色:", True, Colors.BLACK)
+        self.screen.blit(color_title, (100, 320))
+        
+        colors = ["black", "white"]
+        color_names = ["黑子(先手)", "白子(后手)"]
+        for i, (color, name) in enumerate(zip(colors, color_names)):
+            color_y = 350 + i * 40
+            button_rect = pygame.Rect(100, color_y, 200, 30)
+            
+            color_ui = Colors.GREEN if color == self.selected_color else Colors.LIGHT_GRAY
+            pygame.draw.rect(self.screen, color_ui, button_rect)
+            pygame.draw.rect(self.screen, Colors.BLACK, button_rect, 2)
+            
+            text = self.font_small.render(name, True, Colors.BLACK)
+            text_rect = text.get_rect(center=button_rect.center)
+            self.screen.blit(text, text_rect)
     
     def _draw_game(self):
         """绘制游戏界面"""
@@ -521,6 +556,12 @@ class GomokuUI:
         player_text = self.font_medium.render(f"当前玩家: {current_player_text}", True, Colors.BLACK)
         self.screen.blit(player_text, (panel_x + 10, self.margin + y_offset))
         y_offset += 40
+        
+        # 显示人类玩家颜色
+        human_color_text = "黑子" if self.human_player == self.board.BLACK else "白子"
+        human_text = self.font_small.render(f"你执: {human_color_text}", True, Colors.BLACK)
+        self.screen.blit(human_text, (panel_x + 10, self.margin + y_offset))
+        y_offset += 30
         
         # 游戏模式
         mode_text = self.font_small.render(f"模式: {self.game_mode}", True, Colors.BLACK)
